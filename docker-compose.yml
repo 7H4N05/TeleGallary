@@ -1,0 +1,22 @@
+version: '3.9'
+
+services:
+  backend:
+    build: .
+    container_name: telegallery-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          # SQLite DB + session files (persistent)
+      - ./photos:/photos:ro       # Mount your source photos here (read-only)
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - LOG_LEVEL=INFO
+      - DATABASE_URL=sqlite+aiosqlite:///./data/telegallery.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

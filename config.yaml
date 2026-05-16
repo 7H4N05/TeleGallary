@@ -1,0 +1,36 @@
+app:
+  name: "TeleGallery"
+  version: "1.0.0"
+  data_dir: "./data"
+  log_level: "INFO"
+
+backend:
+  host: "127.0.0.1"
+  port: 8000
+  reload: false
+
+database:
+  url: "sqlite+aiosqlite:///./data/telegallery.db"
+
+upload:
+  album_size: 10                  # Telegram max photos per album
+  failover_on_floodwait: true    # use another connected account when one hits FloodWait
+  max_retries: 5
+  retry_base_delay: 5             # seconds
+  retry_max_delay: 300            # seconds
+  concurrent_uploads: 1           # per account
+  photo_extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .webp
+    - .heic
+    - .heif
+
+templates:
+  folder_start: "🎉 {folder_name} PHOTOS START 🎉"
+  folder_end: "✅ {folder_name} PHOTOS END ✅"
+
+telegram:
+  floodwait_safety_buffer: 5     # extra seconds after floodwait
+  session_dir: "./data/sessions"
