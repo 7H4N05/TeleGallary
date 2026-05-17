@@ -18,9 +18,55 @@ from models.schemas import (
 )
 from services import upload_service
 from services.event_bus import get_event_bus
+from telegram.client_manager import get_client_manager
+from telegram.peer_utils import resolve_upload_channel
 from utils.file_utils import compute_total_size, get_folder_display_name, human_size, scan_folders
+from utils.session_crypto import maybe_decrypt_session
+from db.repositories.account_repo import AccountRepository
 
 router = APIRouter()
+
+
+@router.post("/validate-channel")
+async def validate_channel(body: dict):
+    """Check that the account can post to the given channel."""
+    channel_id = (body.get("channel_id") or "").strip()
+    account_id = (body.get("account_id") or "").strip()
+    if not channel_id or not account_id:
+        raise HTTPException(status_code=400, detail="channel_id and account_id required")
+
+    async with AsyncSessionLocal() as db:
+        account = await AccountRepository(db).get_by_id(account_id)
+    if not account or not account.session_string:
+        raise HTTPException(status_code=400, detail="Account not found or not logged in")
+
+    client_mgr = get_client_manager()
+    await client_mgr.add_client(
+        account_id=account.id,
+        phone=account.phone,
+        api_id=account.api_id,
+        api_hash=account.api_hash,
+        session_string=maybe_decrypt_session(account.session_string),
+    )
+    if not await client_mgr.start_client(account_id):
+        raise HTTPException(status_code=400, detail="Could not connect Telegram client")
+
+    client = await client_mgr.get_client(account_id)
+    if not client:
+        raise HTTPException(status_code=400, detail="Telegram client unavailable")
+
+    try:
+        resolved = await resolve_upload_channel(client, channel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    chat = await client.get_chat(resolved)
+    return {
+        "ok": True,
+        "channel_id": resolved,
+        "title": chat.title,
+        "username": chat.username,
+    }
 
 
 @router.post("/start", response_model=dict)
@@ -59,7 +105,10 @@ async def pause_upload(session_id: str):
 
 @router.post("/{session_id}/resume")
 async def resume_upload(session_id: str):
-    ok = await upload_service.resume_session(session_id)
+    try:
+        ok = await upload_service.resume_session(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not ok:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"status": "resumed"}

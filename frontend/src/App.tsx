@@ -16,7 +16,7 @@ import Dashboard from '@/pages/Dashboard'
 import Accounts from '@/pages/Accounts'
 import Logs from '@/pages/Logs'
 import Failed from '@/pages/Failed'
-import History from '@/pages/History'
+import HistoryPage from '@/pages/History'
 import SettingsPage from '@/pages/Settings'
 import { FloodwaitBanner } from '@/components/FloodwaitBanner'
 import clsx from 'clsx'
@@ -133,7 +133,7 @@ function AppInner() {
             <Route path="/accounts" element={<Accounts />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/failed" element={<Failed />} />
-            <Route path="/history" element={<History />} />
+            <Route path="/history" element={<HistoryPage />} />
             <Route path="/settings" element={<SettingsPage />} />
           </Routes>
         </div>

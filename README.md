@@ -55,26 +55,40 @@ Wedding/
 
 ## Quick Start
 
+**Python:** 3.11 or 3.12 recommended. On Windows, use **PowerShell** (older shells do not support `&&` — use `;` or the scripts below).
+
 ### 1. Backend
 
-```bash
-# Install dependencies
-pip install -r backend/requirements.txt
+**PowerShell (from repo root):**
 
-# Start server
-python start.py
+```powershell
+pip install -r backend\requirements.txt
+py start.py
 # → http://127.0.0.1:8000
 # → API docs: http://127.0.0.1:8000/docs
 ```
 
-### 2. Frontend (requires Node.js)
+Or: `.\scripts\start-backend.ps1`
+
+**bash / macOS / Linux:**
 
 ```bash
+pip install -r backend/requirements.txt
+python start.py
+```
+
+### 2. Frontend (requires Node.js)
+
+**PowerShell:**
+
+```powershell
 cd frontend
 npm install
 npm run dev
 # → http://localhost:5173
 ```
+
+Or: `.\scripts\start-frontend.ps1`
 
 ### 2b. Desktop shell (Tauri + Rust)
 
@@ -174,7 +188,7 @@ No duplicate uploads. No duplicate START/END messages. Ever.
 - **Session strings** live in SQLite. Set `TELEGALLERY_SECRET_KEY` in `.env` to store them **encrypted** (see `.env.example`). Otherwise they are saved as plaintext (fine for local dev).
 - On backend start, saved accounts are **warmed** (auto-connect) so uploads and **FloodWait failover** work across multiple accounts without clicking Connect each time.
 - **FloodWait failover**: with `failover_on_floodwait: true` in `config.yaml` (default), if one account hits FloodWait and another account is connected, uploads **switch** to the other account immediately instead of waiting.
-- Run tests: `cd backend && pip install -r requirements.txt && pytest`
+- Run tests (PowerShell): `.\scripts\run-tests.ps1` — or `cd backend; pip install -r requirements.txt; py -m pytest tests -q`
 
 ---
 

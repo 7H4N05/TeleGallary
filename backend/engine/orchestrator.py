@@ -25,6 +25,7 @@ from db.repositories.account_repo import AccountRepository
 from engine.album_batcher import assign_album_indices
 from engine.folder_processor import FolderProcessor
 from telegram.client_manager import get_client_manager
+from telegram.peer_utils import resolve_upload_channel
 from telegram.uploader import TelegramUploader
 from utils.file_utils import get_folder_display_name, scan_folders
 from utils.logger import get_logger
@@ -77,6 +78,8 @@ class UploadOrchestrator:
 
     async def _emit(self, event_type: str, payload: dict):
         payload["session_id"] = self.session_id
+        if "uploaded_files" in payload:
+            self._uploaded_count = int(payload["uploaded_files"])
         # Inject live stats
         elapsed = time.time() - self._start_time if self._start_time else 0
         if elapsed > 0 and self._uploaded_count > 0:
@@ -84,8 +87,8 @@ class UploadOrchestrator:
             remaining = self._total_count - self._uploaded_count
             payload.setdefault("speed_bps", speed)
             payload.setdefault("eta_seconds", remaining / speed if speed > 0 else None)
-        payload["uploaded_files"] = self._uploaded_count
-        payload["total_files"] = self._total_count
+        payload.setdefault("uploaded_files", self._uploaded_count)
+        payload.setdefault("total_files", self._total_count)
         await self._event_bus.emit(event_type, payload)
 
     # ── Main run loop ─────────────────────────────────────────────────
@@ -122,6 +125,32 @@ class UploadOrchestrator:
                 await session_repo.set_status(self.session_id, SessionStatus.failed)
                 await db.commit()
                 return
+
+            client = await client_mgr.get_client(session.account_id)
+            if client:
+                try:
+                    resolved = await resolve_upload_channel(client, session.channel_id)
+                    if resolved != session.channel_id:
+                        from sqlalchemy import update
+                        from db.models import UploadSession
+
+                        await db.execute(
+                            update(UploadSession)
+                            .where(UploadSession.id == self.session_id)
+                            .values(channel_id=resolved)
+                        )
+                        session.channel_id = resolved
+                        await db.commit()
+                except ValueError as e:
+                    logger.error("Channel validation failed", error=str(e))
+                    await log_repo.write(
+                        f"[ERROR] Invalid channel: {e}",
+                        level=LogLevel.ERROR,
+                        session_id=self.session_id,
+                    )
+                    await session_repo.set_status(self.session_id, SessionStatus.failed)
+                    await db.commit()
+                    return
 
             uploader = TelegramUploader(
                 preferred_account_id=session.account_id,

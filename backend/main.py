@@ -27,6 +27,15 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     logger.info("Starting TeleGallery backend", version=settings.app_version)
+    try:
+        import tgcrypto  # noqa: F401
+
+        logger.info("TgCrypto loaded — fast Telegram transfers enabled")
+    except ImportError:
+        logger.warning(
+            "TgCrypto not installed — uploads will be slower. "
+            "Run: backend\\venv\\Scripts\\pip install TgCrypto"
+        )
     await init_db()
     logger.info("Database initialized")
     await _warm_telegram_accounts()

@@ -13,7 +13,10 @@ database:
   url: "sqlite+aiosqlite:///./data/telegallery.db"
 
 upload:
-  album_size: 10                  # Telegram max photos per album
+  album_size: 5                   # smaller batches = faster feedback & fewer timeouts
+  upload_album_timeout: 900       # seconds per album batch before falling back to singles
+  upload_photo_timeout: 600       # seconds per single photo
+  jpeg_quality: 85                # re-encode quality for oversized camera JPEGs
   failover_on_floodwait: true    # use another connected account when one hits FloodWait
   max_retries: 5
   retry_base_delay: 5             # seconds

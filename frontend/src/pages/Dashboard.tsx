@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { useUploadStore } from '@/store/uploadStore'
 import { useAccountStore } from '@/store/accountStore'
+import { uploadApi } from '@/api/client'
 import clsx from 'clsx'
 
 function StatCard({ label, value, sub, color }: {
@@ -20,7 +21,7 @@ function StatCard({ label, value, sub, color }: {
   )
 }
 
-function ResumableBanner() {
+function ResumableBanner({ onError }: { onError: (message: string) => void }) {
   const { resumableSession, isUploading, resumeById, fetchResumable } = useUploadStore()
   const [busy, setBusy] = useState(false)
 
@@ -55,7 +56,8 @@ function ResumableBanner() {
           try {
             await resumeById(resumableSession.id)
           } catch (e: unknown) {
-            console.error(e)
+            const err = e as { response?: { data?: { detail?: string } }; message?: string }
+            onError(err.response?.data?.detail || err.message || 'Could not resume upload')
           } finally {
             setBusy(false)
           }
@@ -132,6 +134,10 @@ function ProgressSection() {
       </div>
 
       {/* Current file */}
+      {progress?.message && (
+        <p className="text-xs text-slate-400">{progress.message}</p>
+      )}
+
       {progress?.current_file && (
         <div className="bg-surface-700 rounded-lg px-3 py-2 border border-white/[0.05]">
           <p className="text-xs text-slate-500 mb-0.5">Current file</p>
@@ -182,15 +188,18 @@ function FolderSelector({ onScan }: { onScan: (path: string) => void }) {
   )
 }
 
-function ScanPreview({ channelId, setChannelId, accountId, setAccountId, onStart }: {
+function ScanPreview({ channelId, setChannelId, accountId, setAccountId, onStart, onError }: {
   channelId: string
   setChannelId: (v: string) => void
   accountId: string
   setAccountId: (v: string) => void
-  onStart: () => void
+  onStart: (resolvedChannelId: string) => Promise<void>
+  onError: (message: string) => void
 }) {
   const { scanResult } = useUploadStore()
   const { accounts } = useAccountStore()
+  const [starting, setStarting] = useState(false)
+  const [channelTitle, setChannelTitle] = useState<string | null>(null)
 
   if (!scanResult) return null
 
@@ -234,9 +243,12 @@ function ScanPreview({ channelId, setChannelId, accountId, setAccountId, onStart
           <label className="label">Telegram Channel ID</label>
           <input
             className="input"
-            placeholder="-100123456789 or @channel"
+            placeholder="-1001234567890 or @channel (not t.me/c/… alone)"
             value={channelId}
-            onChange={e => setChannelId(e.target.value)}
+            onChange={e => {
+              setChannelId(e.target.value)
+              setChannelTitle(null)
+            }}
           />
         </div>
         <div>
@@ -260,11 +272,26 @@ function ScanPreview({ channelId, setChannelId, accountId, setAccountId, onStart
 
       <button
         className="btn-primary w-full justify-center"
-        onClick={onStart}
-        disabled={!channelId || !accountId}
+        disabled={!channelId || !accountId || starting}
+        onClick={async () => {
+          if (!channelId || !accountId || starting) return
+          setStarting(true)
+          setChannelTitle(null)
+          try {
+            const v = await uploadApi.validateChannel(channelId, accountId)
+            setChannelId(v.channel_id)
+            setChannelTitle(v.title)
+            await onStart(v.channel_id)
+          } catch (e: unknown) {
+            const err = e as { response?: { data?: { detail?: string } }; message?: string }
+            onError(err.response?.data?.detail || err.message || 'Could not validate channel')
+          } finally {
+            setStarting(false)
+          }
+        }}
       >
-        <Upload size={15} />
-        Start Upload
+        {starting ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
+        {starting ? 'Validating…' : 'Start Upload'}
       </button>
     </div>
   )
@@ -310,13 +337,14 @@ export default function Dashboard() {
     }
   }
 
-  const handleStart = async () => {
-    if (!scanResult || !channelId || !accountId) return
+  const handleStart = async (resolvedChannelId?: string) => {
+    const channel = resolvedChannelId ?? channelId
+    if (!scanResult || !channel || !accountId) return
     setError(null)
     try {
       await startUpload({
         root_folder: scanResult.root,
-        channel_id: channelId,
+        channel_id: channel,
         account_id: accountId,
       })
       clearScan()
@@ -345,7 +373,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      <ResumableBanner />
+      <ResumableBanner onError={setError} />
 
       <ProgressSection />
       <UploadControls />
@@ -359,6 +387,7 @@ export default function Dashboard() {
             accountId={accountId}
             setAccountId={setAccountId}
             onStart={handleStart}
+            onError={setError}
           />
         </>
       )}

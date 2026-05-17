@@ -50,9 +50,15 @@ class FolderProcessor:
 
     async def _emit_progress(self, file_repo: FileRepository, **kwargs):
         failed_n = await file_repo.count_failed_for_session(self.session_id)
+        uploaded_n = await file_repo.count_uploaded_for_session(self.session_id)
         await self.event_emitter(
             "progress",
-            {"session_id": self.session_id, "failed_files": failed_n, **kwargs},
+            {
+                "session_id": self.session_id,
+                "failed_files": failed_n,
+                "uploaded_files": uploaded_n,
+                **kwargs,
+            },
         )
 
     async def _wait_if_paused(self):
@@ -115,7 +121,7 @@ class FolderProcessor:
             pending_files = await file_repo.list_pending_for_folder(self.folder_id)
             if not pending_files:
                 # All files already uploaded, just send END if missing
-                await self._send_end_marker(folder, folder_repo, log_repo, db)
+                await self._send_end_marker(folder, folder_repo, file_repo, log_repo, db)
                 return True
 
             # Group into albums by album_index
@@ -146,54 +152,25 @@ class FolderProcessor:
                     await file_repo.mark_uploading(f.id)
                 await db.commit()
 
-                try:
-                    messages = await self.uploader.send_album(
-                        self.channel_id, file_paths
-                    )
-
-                    if messages and len(messages) == len(file_ids):
-                        for fid, msg in zip(file_ids, messages):
-                            await file_repo.mark_uploaded(fid, msg.id)
-                            await folder_repo.increment_uploaded(self.folder_id)
-                        await db.commit()
-
-                        await log_repo.write(
-                            f"[INFO] Uploaded album {album_idx} in {folder.name} ({len(file_ids)} photos)",
-                            level=LogLevel.INFO,
-                            session_id=self.session_id,
-                        )
-                        await db.commit()
-
-                        await self._emit_progress(
-                            file_repo,
-                            current_folder=folder.name,
-                            current_album=album_idx,
-                            message=f"Album {album_idx} uploaded",
-                        )
-                    else:
-                        raise RuntimeError(f"Message count mismatch: got {len(messages) if messages else 0}, expected {len(file_ids)}")
-
-                except Exception as e:
-                    logger.error(
-                        "Album upload failed",
-                        album_idx=album_idx,
-                        folder=folder.name,
-                        error=str(e),
-                    )
-                    for f in album_files:
-                        await file_repo.mark_failed(f.id, str(e))
-                        await failed_repo.create(
-                            file_id=f.id,
-                            session_id=self.session_id,
-                            error_type=type(e).__name__,
-                            error_message=str(e),
-                        )
-                    await log_repo.write(
-                        f"[ERROR] Album {album_idx} in {folder.name} failed: {e}",
-                        level=LogLevel.ERROR,
-                        session_id=self.session_id,
-                    )
-                    await db.commit()
+                logger.info(
+                    "Uploading album",
+                    folder=folder.name,
+                    album_idx=album_idx,
+                    photos=len(album_files),
+                )
+                uploaded = await self._upload_album(
+                    album_idx=album_idx,
+                    album_files=album_files,
+                    file_ids=file_ids,
+                    file_paths=file_paths,
+                    folder=folder,
+                    file_repo=file_repo,
+                    folder_repo=folder_repo,
+                    failed_repo=failed_repo,
+                    log_repo=log_repo,
+                    db=db,
+                )
+                if not uploaded:
                     await self._emit_progress(
                         file_repo,
                         current_folder=folder.name,
@@ -202,10 +179,119 @@ class FolderProcessor:
                     )
 
             # ── Step 4: Send END marker ────────────────────────────────
-            await self._send_end_marker(folder, folder_repo, log_repo, db)
+            await self._send_end_marker(folder, folder_repo, file_repo, log_repo, db)
             return True
 
-    async def _send_end_marker(self, folder, folder_repo, log_repo, db):
+    async def _upload_album(
+        self,
+        album_idx: int,
+        album_files,
+        file_ids,
+        file_paths,
+        folder,
+        file_repo,
+        folder_repo,
+        failed_repo,
+        log_repo,
+        db,
+    ) -> bool:
+        """Upload an album; on failure retry photos individually. Returns True if any progress."""
+        try:
+            messages = await self.uploader.send_album(self.channel_id, file_paths)
+
+            if messages and len(messages) == len(file_ids):
+                for fid, msg in zip(file_ids, messages):
+                    await file_repo.mark_uploaded(fid, msg.id)
+                    await folder_repo.increment_uploaded(self.folder_id)
+                await db.commit()
+                await log_repo.write(
+                    f"[INFO] Uploaded album {album_idx} in {folder.name} ({len(file_ids)} photos)",
+                    level=LogLevel.INFO,
+                    session_id=self.session_id,
+                )
+                await db.commit()
+                await self._emit_progress(
+                    file_repo,
+                    current_folder=folder.name,
+                    current_album=album_idx,
+                    message=f"Album {album_idx} uploaded",
+                )
+                return True
+
+            raise RuntimeError(
+                f"Message count mismatch: got {len(messages) if messages else 0}, expected {len(file_ids)}"
+            )
+        except Exception as album_err:
+            logger.warning(
+                "Album batch failed, retrying photos individually",
+                album_idx=album_idx,
+                folder=folder.name,
+                error=str(album_err),
+            )
+            return await self._upload_album_individually(
+                album_idx=album_idx,
+                album_files=album_files,
+                file_ids=file_ids,
+                file_paths=file_paths,
+                folder=folder,
+                file_repo=file_repo,
+                folder_repo=folder_repo,
+                failed_repo=failed_repo,
+                log_repo=log_repo,
+                db=db,
+                album_err=album_err,
+            )
+
+    async def _upload_album_individually(
+        self,
+        album_idx: int,
+        album_files,
+        file_ids,
+        file_paths,
+        folder,
+        file_repo,
+        folder_repo,
+        failed_repo,
+        log_repo,
+        db,
+        album_err: Exception,
+    ) -> bool:
+        ok_count = 0
+        for f, fid, path in zip(album_files, file_ids, file_paths):
+            try:
+                msg = await self.uploader.upload_photo_with_retry(self.channel_id, path)
+                if msg:
+                    await file_repo.mark_uploaded(fid, msg.id)
+                    await folder_repo.increment_uploaded(self.folder_id)
+                    ok_count += 1
+                else:
+                    raise RuntimeError("Upload returned no message")
+            except Exception as e:
+                err = str(e)
+                await file_repo.mark_failed(f.id, err)
+                await failed_repo.create(
+                    file_id=f.id,
+                    session_id=self.session_id,
+                    error_type=type(e).__name__,
+                    error_message=err,
+                )
+        await db.commit()
+        if ok_count:
+            await log_repo.write(
+                f"[INFO] Album {album_idx} in {folder.name}: {ok_count}/{len(file_ids)} photos (individual upload)",
+                level=LogLevel.INFO,
+                session_id=self.session_id,
+            )
+        else:
+            await log_repo.write(
+                f"[ERROR] Album {album_idx} in {folder.name} failed: {album_err}",
+                level=LogLevel.ERROR,
+                session_id=self.session_id,
+            )
+        await db.commit()
+        return ok_count > 0
+
+    async def _send_end_marker(self, folder, folder_repo, file_repo, log_repo, db):
         if folder.end_msg_id is not None:
             return
         end_text = get_settings().folder_end_template.format(

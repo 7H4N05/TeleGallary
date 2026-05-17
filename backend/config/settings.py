@@ -38,10 +38,13 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/telegallery.db"
 
     # Upload engine
-    album_size: int = 10
+    album_size: int = 5
     max_retries: int = 5
     retry_base_delay: int = 5
     retry_max_delay: int = 300
+    upload_album_timeout: int = 900
+    upload_photo_timeout: int = 600
+    jpeg_quality: int = 85
     concurrent_uploads: int = 1
     failover_on_floodwait: bool = True
     photo_extensions: List[str] = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]
@@ -80,10 +83,13 @@ class Settings(BaseSettings):
             )
 
         if "upload" in cfg:
-            flat["album_size"] = cfg["upload"].get("album_size", 10)
+            flat["album_size"] = cfg["upload"].get("album_size", 5)
             flat["max_retries"] = cfg["upload"].get("max_retries", 5)
             flat["retry_base_delay"] = cfg["upload"].get("retry_base_delay", 5)
             flat["retry_max_delay"] = cfg["upload"].get("retry_max_delay", 300)
+            flat["upload_album_timeout"] = cfg["upload"].get("upload_album_timeout", 900)
+            flat["upload_photo_timeout"] = cfg["upload"].get("upload_photo_timeout", 600)
+            flat["jpeg_quality"] = cfg["upload"].get("jpeg_quality", 85)
             flat["concurrent_uploads"] = cfg["upload"].get("concurrent_uploads", 1)
             flat["failover_on_floodwait"] = cfg["upload"].get("failover_on_floodwait", True)
             flat["photo_extensions"] = cfg["upload"].get(

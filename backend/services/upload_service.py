@@ -12,12 +12,39 @@ from db.repositories.account_repo import AccountRepository
 from db.repositories.session_repo import SessionRepository
 from engine.orchestrator import UploadOrchestrator
 from telegram.client_manager import get_client_manager
+from telegram.peer_utils import resolve_upload_channel
 from utils.logger import get_logger
+from utils.session_crypto import maybe_decrypt_session
 
 logger = get_logger(__name__)
 
 # Active orchestrators keyed by session_id
 _active_sessions: Dict[str, UploadOrchestrator] = {}
+
+
+async def _validate_channel_for_account(account_id: str, channel_id: str) -> str:
+    """Connect client, resolve channel, return canonical peer id."""
+    async with AsyncSessionLocal() as db:
+        account = await AccountRepository(db).get_by_id(account_id)
+    if not account:
+        raise ValueError(f"Account not found: {account_id}")
+
+    client_mgr = get_client_manager()
+    await client_mgr.add_client(
+        account_id=account.id,
+        phone=account.phone,
+        api_id=account.api_id,
+        api_hash=account.api_hash,
+        session_string=maybe_decrypt_session(account.session_string),
+    )
+    if not await client_mgr.start_client(account_id):
+        raise RuntimeError(f"Could not connect Telegram client for account {account_id}")
+
+    client = await client_mgr.get_client(account_id)
+    if not client:
+        raise RuntimeError(f"Telegram client not available for account {account_id}")
+
+    return await resolve_upload_channel(client, channel_id)
 
 
 async def start_session(
@@ -27,6 +54,12 @@ async def start_session(
     session_name: Optional[str] = None,
 ) -> str:
     """Create and start a new upload session. Returns session_id."""
+    running = [sid for sid, o in _active_sessions.items() if o.is_running]
+    if running:
+        raise ValueError(
+            "An upload is already running. Stop or pause it before starting a new session."
+        )
+
     async with AsyncSessionLocal() as db:
         session_repo = SessionRepository(db)
         account_repo = AccountRepository(db)
@@ -36,24 +69,21 @@ async def start_session(
         if not account:
             raise ValueError(f"Account not found: {account_id}")
 
-        # Create session record
+    resolved_channel_id = await _validate_channel_for_account(account_id, channel_id)
+
+    async with AsyncSessionLocal() as db:
+        session_repo = SessionRepository(db)
         name = session_name or f"Upload {root_folder}"
         session = await session_repo.create(
             {
                 "name": name,
                 "root_folder": root_folder,
-                "channel_id": channel_id,
+                "channel_id": resolved_channel_id,
                 "account_id": account_id,
             }
         )
         await db.commit()
         session_id = session.id
-
-    # Ensure client is started
-    client_mgr = get_client_manager()
-    started = await client_mgr.start_client(account_id)
-    if not started:
-        raise RuntimeError(f"Could not connect Telegram client for account {account_id}")
 
     orchestrator = UploadOrchestrator(session_id=session_id)
     _active_sessions[session_id] = orchestrator
@@ -84,10 +114,28 @@ async def resume_session(session_id: str) -> bool:
             if not s or not s.account_id:
                 return False
             acct_id = s.account_id
+            stored_channel = s.channel_id
+
+        try:
+            resolved = await _validate_channel_for_account(acct_id, stored_channel)
+        except ValueError as e:
+            logger.error("Channel validation failed on resume", error=str(e))
+            raise ValueError(str(e)) from e
+
+        if resolved != stored_channel:
+            async with AsyncSessionLocal() as db:
+                from sqlalchemy import update
+                from db.models import UploadSession
+
+                await db.execute(
+                    update(UploadSession)
+                    .where(UploadSession.id == session_id)
+                    .values(channel_id=resolved)
+                )
+                await db.commit()
+
         orch = UploadOrchestrator(session_id=session_id)
         _active_sessions[session_id] = orch
-        client_mgr = get_client_manager()
-        await client_mgr.start_client(acct_id)
         orch.start()
     else:
         orch.resume()

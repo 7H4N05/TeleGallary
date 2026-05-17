@@ -79,6 +79,7 @@ export const useUploadStore = create<UploadStore>((set, get) => ({
       isPaused: false,
       resumableSession: null,
     })
+    void get().fetchSessions()
   },
 
   scan: async (rootFolder: string) => {

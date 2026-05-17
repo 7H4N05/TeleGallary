@@ -23,6 +23,17 @@ export const uploadApi = {
   scan: (rootFolder: string): Promise<ScanResult> =>
     api.post('/upload/scan', { root_folder: rootFolder }).then(r => r.data),
 
+  validateChannel: (channelId: string, accountId: string): Promise<{
+    ok: boolean
+    channel_id: string
+    title: string
+    username?: string
+  }> =>
+    api.post('/upload/validate-channel', {
+      channel_id: channelId,
+      account_id: accountId,
+    }).then(r => r.data),
+
   start: (payload: {
     root_folder: string
     channel_id: string

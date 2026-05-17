@@ -64,6 +64,15 @@ class FileRepository:
         )
         return int(result.scalar_one() or 0)
 
+    async def count_uploaded_for_session(self, session_id: str) -> int:
+        result = await self.db.execute(
+            select(func.count(File.id)).where(
+                File.session_id == session_id,
+                File.status == FileStatus.uploaded,
+            )
+        )
+        return int(result.scalar_one() or 0)
+
     async def reset_uploading_to_pending(self, session_id: str) -> None:
         """
         On restart, any file stuck in 'uploading' state means a crash
