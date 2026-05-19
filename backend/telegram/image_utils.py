@@ -87,7 +87,10 @@ def _prepare_image_path(src: Path, force_convert: bool) -> str:
     with Image.open(src) as im:
         im.load()
         normalized = _normalize_for_telegram(im)
-        return _save_jpeg(normalized, src.stem)
+        result = _save_jpeg(normalized, src.stem)
+        # Eagerly release the ~72 MB pixel buffer instead of waiting for GC
+        normalized.close()
+        return result
 
 
 def _normalize_for_telegram(im: Image.Image) -> Image.Image:
@@ -121,7 +124,18 @@ def _normalize_for_telegram(im: Image.Image) -> Image.Image:
 def _save_jpeg(im: Image.Image, stem: str) -> str:
     fd, tmp_path = tempfile.mkstemp(prefix=f"tg_{stem}_", suffix=".jpg")
     os.close(fd)
+
+    # Use the adaptive controller's current quality if active,
+    # otherwise fall back to the static config value.
     quality = get_settings().jpeg_quality
+    try:
+        from monitoring.reliability_controller import get_reliability_controller
+        ctrl = get_reliability_controller()
+        if ctrl:
+            quality = ctrl.adaptive.params.jpeg_quality
+    except Exception:
+        pass
+
     try:
         im.save(tmp_path, format="JPEG", quality=quality, optimize=False)
         return tmp_path

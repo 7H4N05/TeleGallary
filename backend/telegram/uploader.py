@@ -8,6 +8,7 @@ Image prep runs in a thread pool so the asyncio event loop stays responsive duri
 from __future__ import annotations
 
 import asyncio
+import gc
 from typing import Callable, List, Optional, Tuple
 
 from pyrogram.errors import FloodWait, RPCError
@@ -19,6 +20,23 @@ from telegram.image_utils import cleanup_temp_path, prepare_photo_for_upload
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _prepare_photo_with_cleanup(path: str) -> tuple:
+    """Prepare a single photo and aggressively free PIL memory.
+
+    Runs in a thread-pool worker.  After the temp JPEG is written,
+    we force-close any lingering PIL image objects and nudge the GC
+    so that the ~72 MB raw pixel buffer is released BEFORE the next
+    image starts decompressing.
+    """
+    try:
+        return prepare_photo_for_upload(path)
+    finally:
+        # PIL keeps decoded pixel data in memory until the Image object
+        # is garbage-collected.  Explicit gc.collect() here ensures the
+        # previous image's buffer is freed before we load the next one.
+        gc.collect(generation=0)
 
 
 class TelegramUploader:
@@ -65,19 +83,28 @@ class TelegramUploader:
         return cb
 
     async def _prepare_paths_async(self, photo_paths: List[str]) -> Tuple[List[str], List[Tuple[str, bool]]]:
-        """Prepare files off the event loop (PIL is CPU-heavy)."""
+        """Prepare files off the event loop — SEQUENTIALLY to cap memory.
+
+        Previous implementation used asyncio.gather() which decompressed all
+        images simultaneously.  A 6000×4000 Sony JPEG is ~72 MB in raw pixels;
+        10 in parallel = 720 MB peak RAM, causing memory_pressure → GC churn →
+        quality ratchet → eventual WinError 10055 (socket buffer exhaustion).
+
+        Sequential processing keeps peak at ~80 MB (one image + one temp JPEG).
+        """
         n = len(photo_paths)
         if n:
             await self._emit_status(f"Preparing {n} photo(s) for Telegram…")
             logger.info("Preparing photos for upload", count=n)
 
-        async def one(path: str) -> Tuple[str, bool]:
-            return await asyncio.to_thread(prepare_photo_for_upload, path)
-
-        results = await asyncio.gather(*[one(p) for p in photo_paths])
+        results: List[Tuple[str, bool]] = []
+        for i, path in enumerate(photo_paths):
+            result = await asyncio.to_thread(
+                _prepare_photo_with_cleanup, path
+            )
+            results.append(result)
         upload_paths = [r[0] for r in results]
-        cleanup = list(results)
-        return upload_paths, cleanup
+        return upload_paths, results
 
     @staticmethod
     def _cleanup_all(cleanup: List[Tuple[str, bool]]) -> None:
@@ -141,6 +168,10 @@ class TelegramUploader:
         finally:
             self._cleanup_all(cleanup)
             self._last_progress_pct = -1
+            # Brief cooldown to let Windows reclaim TCP socket buffers.
+            # Without this, rapid album uploads exhaust the non-paged pool
+            # and crash with WinError 10055.
+            await asyncio.sleep(1.0)
 
     async def _send_single_photo(
         self,

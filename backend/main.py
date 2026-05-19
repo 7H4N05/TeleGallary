@@ -45,6 +45,10 @@ async def lifespan(app: FastAPI):
     await _init_metrics_tables()
 
     logger.info("Database initialized")
+
+    # v2.1: Clean up orphaned temp files from previous crashed sessions
+    _cleanup_orphaned_temp_files()
+
     await _warm_telegram_accounts()
 
     # v2: Start health monitor (always running, independent of upload sessions)
@@ -61,6 +65,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down TeleGallery backend")
 
 
+
 async def _init_metrics_tables():
     """Create the metrics_snapshots table if it doesn't exist."""
     try:
@@ -73,6 +78,32 @@ async def _init_metrics_tables():
     except Exception as e:
         logger.warning("Metrics table creation skipped", error=str(e))
 
+
+def _cleanup_orphaned_temp_files():
+    """Remove temp JPEG files from previous crashed sessions.
+
+    The image normalizer writes temporary files like tg_*.jpg to %TEMP%.
+    If the process dies mid-upload, these files are orphaned.  We clean up
+    any that are older than 1 hour to avoid accumulation.
+    """
+    import glob
+    import os
+    import tempfile
+    import time as _time
+
+    tmp_dir = tempfile.gettempdir()
+    pattern = os.path.join(tmp_dir, "tg_*_.jpg")
+    cutoff = _time.time() - 3600  # 1 hour ago
+    removed = 0
+    for path in glob.iglob(pattern):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.unlink(path)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info("Cleaned up orphaned temp files", count=removed)
 
 async def _warm_telegram_accounts():
     """Connect all saved accounts so uploads and FloodWait failover work without manual Connect."""

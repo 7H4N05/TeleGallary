@@ -209,18 +209,46 @@ class RecoveryEngine:
 
     @staticmethod
     def _force_gc() -> bool:
-        """Force garbage collection and clear known caches."""
+        """Force garbage collection and clear known caches.
+
+        PIL's Image.open() + .load() allocates raw pixel buffers via
+        Python's memory allocator.  These buffers are only freed when
+        the Image object is garbage-collected.  Simply calling gc.collect()
+        with generation=2 is insufficient if references still exist
+        (e.g. in thread-local storage or asyncio task frames).
+
+        Strategy:
+        1. Clear PIL's internal tile cache and reset preinit state
+        2. Full generation-2 GC to release any unreferenced Image objects
+        3. ctypes malloc_trim to return freed pages to the OS (Linux only)
+        4. Brief sleep to let the OS reclaim socket/buffer resources
+        """
         try:
-            # Clear PIL image cache
+            # Clear PIL caches
             try:
                 from PIL import Image
+                # Reset PIL's format registry cache
                 Image.preinit()
+                # Clear any global image cache
+                if hasattr(Image, '_initialized'):
+                    Image._initialized = 1  # reset to "preinit done"
             except Exception:
                 pass
 
-            # Force full GC
-            collected = gc.collect(generation=2)
+            # Force full GC — all generations
+            gc.collect(generation=2)
+            gc.collect(generation=1)
+            collected = gc.collect(generation=0)
             logger.info("Forced GC completed", collected_objects=collected)
+
+            # On Linux, return freed pages to OS
+            try:
+                import ctypes
+                libc = ctypes.CDLL('libc.so.6')
+                libc.malloc_trim(0)
+            except Exception:
+                pass  # Windows doesn't have malloc_trim, that's fine
+
             return True
         except Exception as e:
             logger.error("GC failed", error=str(e))

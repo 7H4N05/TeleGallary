@@ -84,6 +84,8 @@ class AdaptiveController:
         self._adjust_interval = adjust_interval
         self._task: Optional[asyncio.Task] = None
         self._last_floodwait_at: float = 0.0
+        self._last_memory_pressure_at: float = 0.0  # tracks quality recovery eligibility
+        self._quality_recovery_streak: int = 0       # consecutive checks without memory pressure
         self._running = False
 
     @property
@@ -154,6 +156,8 @@ class AdaptiveController:
             self._multiplicative_decrease("Throughput collapse")
         elif event.failure_type == FailureType.MEMORY_PRESSURE:
             self._reduce_quality()
+            self._last_memory_pressure_at = time.monotonic()
+            self._quality_recovery_streak = 0
         elif event.failure_type == FailureType.EVENT_LOOP_SATURATION:
             self._reduce_concurrency(reason="Event loop saturated")
 
@@ -249,10 +253,44 @@ class AdaptiveController:
             p.jpeg_quality = max(p.min_jpeg_quality, p.jpeg_quality - 5)
             logger.info("JPEG quality reduced for memory", quality=p.jpeg_quality)
 
+    def _restore_quality(self):
+        """Gradually restore JPEG quality when memory pressure subsides.
+
+        Called during periodic adjustment when no memory_pressure events
+        have occurred for a sustained period.  Recovers quality by +5 per
+        cycle (every 30s) up to the configured max, so a session that had
+        to drop from 85→60 will recover in ~2.5 minutes of stable operation.
+        """
+        p = self._params
+        from config.settings import get_settings
+        target = get_settings().jpeg_quality  # the user-configured default
+        if p.jpeg_quality < target:
+            p.jpeg_quality = min(target, p.jpeg_quality + 5)
+            logger.info(
+                "JPEG quality restored",
+                quality=p.jpeg_quality,
+                target=target,
+            )
+
     def _periodic_adjust(self):
         """Gentle adjustments based on metrics trends."""
         m = self._metrics
         p = self._params
+        now = time.monotonic()
+
+        # ── Quality recovery: if no memory pressure for 2+ minutes, restore ──
+        if self._last_memory_pressure_at > 0:
+            since_pressure = now - self._last_memory_pressure_at
+            if since_pressure > 120:  # 2 minutes stable
+                self._quality_recovery_streak += 1
+                if self._quality_recovery_streak >= 2:  # 2 consecutive checks (~60s)
+                    self._restore_quality()
+                    self._quality_recovery_streak = 0
+            else:
+                self._quality_recovery_streak = 0
+        elif p.success_streak >= 10:
+            # Never had memory pressure but quality somehow below default
+            self._restore_quality()
 
         # If current speed is significantly better than usual, try increasing
         if (

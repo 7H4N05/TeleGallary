@@ -80,12 +80,17 @@ class FolderProcessor:
     async def process(self) -> bool:
         """
         Process this folder. Returns True if completed, False if stopped/failed.
+
+        v2.1: Per-album scoped DB sessions instead of one long-lived session.
+        The previous approach held a single SQLAlchemy session for the entire
+        folder (potentially hours), accumulating dirty objects in the identity
+        map and pinning a SQLite WAL writer — contributing to memory growth.
         """
+        # ── Phase 1: Folder-level setup (short-lived session) ──────────
         async with AsyncSessionLocal() as db:
             folder_repo = FolderRepository(db)
             file_repo = FileRepository(db)
             log_repo = LogRepository(db)
-            failed_repo = FailedUploadRepository(db)
 
             folder = await folder_repo.get_by_id(self.folder_id)
             if not folder:
@@ -94,6 +99,8 @@ class FolderProcessor:
             if folder.status == FolderStatus.completed:
                 logger.info("Folder already completed, skipping", folder=folder.name)
                 return True
+
+            folder_name = folder.name  # cache for use outside session
 
             await log_repo.write(
                 f"[INFO] Processing folder: {folder.name}",
@@ -140,89 +147,234 @@ class FolderProcessor:
                 albums.setdefault(f.album_index, []).append(f)
             sorted_albums = sorted(albums.items())
 
-            # ── Step 3: Upload album by album ──────────────────────────
+            # Snapshot file data we need outside the session
+            album_snapshots = []
             for album_idx, album_files in sorted_albums:
-                await self._wait_if_paused()
-                if self.stop_event.is_set():
-                    await db.commit()
-                    return False
+                album_snapshots.append((
+                    album_idx,
+                    [(f.id, f.path, f.filename, f.size_bytes) for f in album_files],
+                ))
 
-                file_paths = [f.path for f in album_files]
-                file_ids = [f.id for f in album_files]
+        # ── Phase 2: Upload albums (per-album scoped sessions) ─────────
+        for album_idx, file_tuples in album_snapshots:
+            await self._wait_if_paused()
+            if self.stop_event.is_set():
+                return False
 
+            file_ids = [ft[0] for ft in file_tuples]
+            file_paths = [ft[1] for ft in file_tuples]
+            file_names = [ft[2] for ft in file_tuples]
+            file_sizes = [ft[3] for ft in file_tuples]
+
+            # Mark uploading + emit progress in a scoped session
+            async with AsyncSessionLocal() as db:
+                file_repo = FileRepository(db)
                 await self._emit_progress(
                     file_repo,
-                    current_folder=folder.name,
+                    current_folder=folder_name,
                     current_album=album_idx,
-                    current_file=album_files[0].filename,
+                    current_file=file_names[0],
                 )
-
-                # Mark all as uploading
-                for f in album_files:
-                    await file_repo.mark_uploading(f.id)
+                for fid in file_ids:
+                    await file_repo.mark_uploading(fid)
                 await db.commit()
 
-                logger.info(
-                    "Uploading album",
-                    folder=folder.name,
-                    album_idx=album_idx,
-                    photos=len(album_files),
-                )
+            logger.info(
+                "Uploading album",
+                folder=folder_name,
+                album_idx=album_idx,
+                photos=len(file_tuples),
+            )
 
-                # v2: Record per-upload timing
-                upload_start = time.monotonic()
+            # v2: Record per-upload timing
+            upload_start = time.monotonic()
 
-                uploaded = await self._upload_album(
-                    album_idx=album_idx,
-                    album_files=album_files,
-                    file_ids=file_ids,
-                    file_paths=file_paths,
-                    folder=folder,
-                    file_repo=file_repo,
-                    folder_repo=folder_repo,
-                    failed_repo=failed_repo,
-                    log_repo=log_repo,
-                    db=db,
-                )
+            # Upload (uses Telegram client, no DB needed)
+            uploaded = await self._upload_album_scoped(
+                album_idx=album_idx,
+                file_ids=file_ids,
+                file_paths=file_paths,
+                file_sizes=file_sizes,
+                folder_name=folder_name,
+            )
 
-                upload_end = time.monotonic()
+            upload_end = time.monotonic()
 
-                # v2: Record metrics for this album batch
-                if self._metrics and self._reliability:
-                    for f in album_files:
-                        timing = UploadTiming(
-                            file_id=f.id,
-                            file_size_bytes=f.size_bytes,
-                            started_at=upload_start,
-                            completed_at=upload_end,
-                            # Distribute total time across phases (approximation)
-                            network_duration=(upload_end - upload_start) / len(album_files),
-                            success=uploaded,
-                        )
-                        self._metrics.record_upload(timing)
+            # v2: Record metrics for this album batch
+            if self._metrics and self._reliability:
+                for i, fid in enumerate(file_ids):
+                    timing = UploadTiming(
+                        file_id=fid,
+                        file_size_bytes=file_sizes[i],
+                        started_at=upload_start,
+                        completed_at=upload_end,
+                        # Distribute total time across phases (approximation)
+                        network_duration=(upload_end - upload_start) / len(file_ids),
+                        success=uploaded,
+                    )
+                    self._metrics.record_upload(timing)
 
-                    if uploaded:
-                        self._reliability.on_upload_success()
-                    else:
-                        self._reliability.on_upload_failure()
+                if uploaded:
+                    self._reliability.on_upload_success()
+                else:
+                    self._reliability.on_upload_failure()
 
-                # v2: Apply pacing delay from adaptive controller
-                if self._reliability:
-                    pacing = self._reliability.adaptive.params.pacing_delay_seconds
-                    if pacing > 0:
-                        await asyncio.sleep(pacing)
+            # v2: Apply pacing delay from adaptive controller
+            if self._reliability:
+                pacing = self._reliability.adaptive.params.pacing_delay_seconds
+                if pacing > 0:
+                    await asyncio.sleep(pacing)
 
-                if not uploaded:
+            if not uploaded:
+                async with AsyncSessionLocal() as db:
+                    file_repo = FileRepository(db)
                     await self._emit_progress(
                         file_repo,
-                        current_folder=folder.name,
+                        current_folder=folder_name,
                         current_album=album_idx,
-                        message=f"Album {album_idx} failed ({len(album_files)} files)",
+                        message=f"Album {album_idx} failed ({len(file_ids)} files)",
                     )
 
-            # ── Step 4: Send END marker ────────────────────────────────
-            await self._send_end_marker(folder, folder_repo, file_repo, log_repo, db)
-            return True
+        # ── Phase 3: Send END marker (short-lived session) ─────────────
+        async with AsyncSessionLocal() as db:
+            folder_repo = FolderRepository(db)
+            file_repo = FileRepository(db)
+            log_repo = LogRepository(db)
+            folder = await folder_repo.get_by_id(self.folder_id)
+            if folder:
+                await self._send_end_marker(folder, folder_repo, file_repo, log_repo, db)
+        return True
+
+    async def _upload_album_scoped(
+        self,
+        album_idx: int,
+        file_ids: list,
+        file_paths: list,
+        file_sizes: list,
+        folder_name: str,
+    ) -> bool:
+        """Upload an album with its own scoped DB session for result persistence."""
+        try:
+            messages = await self.uploader.send_album(self.channel_id, file_paths)
+
+            if messages and len(messages) == len(file_ids):
+                async with AsyncSessionLocal() as db:
+                    file_repo = FileRepository(db)
+                    folder_repo = FolderRepository(db)
+                    log_repo = LogRepository(db)
+                    for fid, msg in zip(file_ids, messages):
+                        await file_repo.mark_uploaded(fid, msg.id)
+                        await folder_repo.increment_uploaded(self.folder_id)
+                    await log_repo.write(
+                        f"[INFO] Uploaded album {album_idx} in {folder_name} ({len(file_ids)} photos)",
+                        level=LogLevel.INFO,
+                        session_id=self.session_id,
+                    )
+                    await db.commit()
+                    await self._emit_progress(
+                        file_repo,
+                        current_folder=folder_name,
+                        current_album=album_idx,
+                        message=f"Album {album_idx} uploaded",
+                    )
+                return True
+
+            raise RuntimeError(
+                f"Message count mismatch: got {len(messages) if messages else 0}, expected {len(file_ids)}"
+            )
+        except Exception as album_err:
+            logger.warning(
+                "Album batch failed, retrying photos individually",
+                album_idx=album_idx,
+                folder=folder_name,
+                error=str(album_err),
+            )
+            return await self._upload_individually_scoped(
+                album_idx=album_idx,
+                file_ids=file_ids,
+                file_paths=file_paths,
+                file_sizes=file_sizes,
+                folder_name=folder_name,
+                album_err=album_err,
+            )
+
+    async def _upload_individually_scoped(
+        self,
+        album_idx: int,
+        file_ids: list,
+        file_paths: list,
+        file_sizes: list,
+        folder_name: str,
+        album_err: Exception,
+    ) -> bool:
+        """Individual upload fallback with scoped DB sessions."""
+        ok_count = 0
+        for fid, path, size in zip(file_ids, file_paths, file_sizes):
+            file_start = time.monotonic()
+            try:
+                msg = await self.uploader.upload_photo_with_retry(self.channel_id, path)
+                if msg:
+                    async with AsyncSessionLocal() as db:
+                        file_repo = FileRepository(db)
+                        folder_repo = FolderRepository(db)
+                        await file_repo.mark_uploaded(fid, msg.id)
+                        await folder_repo.increment_uploaded(self.folder_id)
+                        await db.commit()
+                    ok_count += 1
+
+                    if self._metrics:
+                        timing = UploadTiming(
+                            file_id=fid,
+                            file_size_bytes=size,
+                            started_at=file_start,
+                            completed_at=time.monotonic(),
+                            network_duration=time.monotonic() - file_start,
+                            success=True,
+                        )
+                        self._metrics.record_upload(timing)
+                else:
+                    raise RuntimeError("Upload returned no message")
+            except Exception as e:
+                err = str(e)
+                async with AsyncSessionLocal() as db:
+                    file_repo = FileRepository(db)
+                    failed_repo = FailedUploadRepository(db)
+                    await file_repo.mark_failed(fid, err)
+                    await failed_repo.create(
+                        file_id=fid,
+                        session_id=self.session_id,
+                        error_type=type(e).__name__,
+                        error_message=err,
+                    )
+                    await db.commit()
+
+                if self._metrics:
+                    timing = UploadTiming(
+                        file_id=fid,
+                        file_size_bytes=size,
+                        started_at=file_start,
+                        completed_at=time.monotonic(),
+                        success=False,
+                        error_type=type(e).__name__,
+                    )
+                    self._metrics.record_upload(timing)
+
+        async with AsyncSessionLocal() as db:
+            log_repo = LogRepository(db)
+            if ok_count:
+                await log_repo.write(
+                    f"[INFO] Album {album_idx} in {folder_name}: {ok_count}/{len(file_ids)} photos (individual upload)",
+                    level=LogLevel.INFO,
+                    session_id=self.session_id,
+                )
+            else:
+                await log_repo.write(
+                    f"[ERROR] Album {album_idx} in {folder_name} failed: {album_err}",
+                    level=LogLevel.ERROR,
+                    session_id=self.session_id,
+                )
+            await db.commit()
+        return ok_count > 0
 
     async def _upload_album(
         self,
