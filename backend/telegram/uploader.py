@@ -26,9 +26,13 @@ class TelegramUploader:
         self,
         preferred_account_id: str,
         event_emitter: Optional[Callable] = None,
+        channel_access_hash: Optional[int] = None,
     ):
         self.preferred_account_id = preferred_account_id
-        self.fw_handler = FloodWaitHandler(event_emitter=event_emitter)
+        self.fw_handler = FloodWaitHandler(
+            event_emitter=event_emitter,
+            channel_access_hash=channel_access_hash,
+        )
         self.event_emitter = event_emitter
         self._last_progress_pct: int = -1
 
@@ -90,7 +94,10 @@ class TelegramUploader:
         return await self.fw_handler.run(
             self.preferred_account_id,
             lambda c: c.send_message(channel_id, text),
+            channel_id=channel_id,
         )
+
+
 
     async def send_album(
         self,
@@ -108,24 +115,25 @@ class TelegramUploader:
         settings = get_settings()
         upload_paths, cleanup = await self._prepare_paths_async(photo_paths)
         try:
-            media = [
-                InputMediaPhoto(
-                    media=path,
-                    caption=caption if i == 0 else None,
-                )
-                for i, path in enumerate(upload_paths)
-            ]
-
             await self._emit_status(
-                f"Uploading album ({len(media)} photos)…",
+                f"Uploading {len(upload_paths)} photos…",
                 current_file=photo_paths[0].split("\\")[-1].split("/")[-1],
             )
-            logger.info("Sending media group", photos=len(media))
+            logger.info("Sending media group", photos=len(upload_paths))
+
+            media = [
+                InputMediaPhoto(
+                    media=upath,
+                    caption=caption if i == 0 else None,
+                )
+                for i, upath in enumerate(upload_paths)
+            ]
 
             return await self._run_with_timeout(
                 self.fw_handler.run(
                     self.preferred_account_id,
                     lambda c: c.send_media_group(channel_id, media),
+                    channel_id=channel_id,
                 ),
                 settings.upload_album_timeout,
                 "Album upload",
@@ -155,6 +163,7 @@ class TelegramUploader:
                         caption=caption,
                         progress=progress,
                     ),
+                    channel_id=channel_id,
                 ),
                 settings.upload_photo_timeout,
                 f"Photo upload ({name})",
@@ -193,6 +202,7 @@ class TelegramUploader:
                                 upload_path,
                                 progress=progress,
                             ),
+                            channel_id=channel_id,
                         ),
                         settings.upload_photo_timeout,
                         f"Photo upload ({name})",

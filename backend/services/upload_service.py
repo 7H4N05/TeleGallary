@@ -6,13 +6,15 @@ Manages the lifecycle of UploadOrchestrator instances.
 import asyncio
 from typing import Dict, Optional
 
+from sqlalchemy import update
+
 from db.database import AsyncSessionLocal
-from db.models import SessionStatus
+from db.models import SessionStatus, UploadSession
 from db.repositories.account_repo import AccountRepository
 from db.repositories.session_repo import SessionRepository
 from engine.orchestrator import UploadOrchestrator
 from telegram.client_manager import get_client_manager
-from telegram.peer_utils import resolve_upload_channel
+from telegram.peer_utils import resolve_upload_channel, restore_peer_in_session
 from utils.logger import get_logger
 from utils.session_crypto import maybe_decrypt_session
 
@@ -22,8 +24,8 @@ logger = get_logger(__name__)
 _active_sessions: Dict[str, UploadOrchestrator] = {}
 
 
-async def _validate_channel_for_account(account_id: str, channel_id: str) -> str:
-    """Connect client, resolve channel, return canonical peer id."""
+async def _connect_account(account_id: str) -> None:
+    """Ensure the Pyrogram client for this account is registered and connected."""
     async with AsyncSessionLocal() as db:
         account = await AccountRepository(db).get_by_id(account_id)
     if not account:
@@ -40,11 +42,41 @@ async def _validate_channel_for_account(account_id: str, channel_id: str) -> str
     if not await client_mgr.start_client(account_id):
         raise RuntimeError(f"Could not connect Telegram client for account {account_id}")
 
-    client = await client_mgr.get_client(account_id)
+
+async def _resolve_and_store_access_hash(
+    account_id: str,
+    channel_id: str,
+    session_id: Optional[str] = None,
+) -> tuple[str, Optional[int]]:
+    """
+    Connect the client, resolve the channel, extract the access_hash, and
+    optionally persist it back to the session row.
+
+    Returns (canonical_peer_id, access_hash).
+    """
+    await _connect_account(account_id)
+
+    client = await get_client_manager().get_client(account_id)
     if not client:
         raise RuntimeError(f"Telegram client not available for account {account_id}")
 
-    return await resolve_upload_channel(client, channel_id)
+    peer_id, access_hash = await resolve_upload_channel(client, channel_id)
+
+    if session_id and access_hash is not None:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(UploadSession)
+                .where(UploadSession.id == session_id)
+                .values(channel_access_hash=access_hash)
+            )
+            await db.commit()
+        logger.info(
+            "Stored channel access_hash in session",
+            session_id=session_id,
+            peer_id=peer_id,
+        )
+
+    return peer_id, access_hash
 
 
 async def start_session(
@@ -61,15 +93,14 @@ async def start_session(
         )
 
     async with AsyncSessionLocal() as db:
-        session_repo = SessionRepository(db)
-        account_repo = AccountRepository(db)
-
-        # Validate account exists
-        account = await account_repo.get_by_id(account_id)
+        account = await AccountRepository(db).get_by_id(account_id)
         if not account:
             raise ValueError(f"Account not found: {account_id}")
 
-    resolved_channel_id = await _validate_channel_for_account(account_id, channel_id)
+    # Resolve channel — this also populates the peer cache in MemoryStorage
+    resolved_channel_id, access_hash = await _resolve_and_store_access_hash(
+        account_id, channel_id
+    )
 
     async with AsyncSessionLocal() as db:
         session_repo = SessionRepository(db)
@@ -79,6 +110,7 @@ async def start_session(
                 "name": name,
                 "root_folder": root_folder,
                 "channel_id": resolved_channel_id,
+                "channel_access_hash": access_hash,
                 "account_id": account_id,
             }
         )
@@ -109,36 +141,47 @@ async def resume_session(session_id: str) -> bool:
     if not orch:
         # Session may need re-attaching after restart
         async with AsyncSessionLocal() as db:
-            sr = SessionRepository(db)
-            s = await sr.get_by_id(session_id)
+            s = await SessionRepository(db).get_by_id(session_id)
             if not s or not s.account_id:
                 return False
             acct_id = s.account_id
             stored_channel = s.channel_id
+            stored_hash = s.channel_access_hash
 
-        try:
-            resolved = await _validate_channel_for_account(acct_id, stored_channel)
-        except ValueError as e:
-            logger.error("Channel validation failed on resume", error=str(e))
-            raise ValueError(str(e)) from e
+        # Ensure client is connected
+        await _connect_account(acct_id)
+        client = await get_client_manager().get_client(acct_id)
 
-        if resolved != stored_channel:
-            async with AsyncSessionLocal() as db:
-                from sqlalchemy import update
-                from db.models import UploadSession
-
-                await db.execute(
-                    update(UploadSession)
-                    .where(UploadSession.id == session_id)
-                    .values(channel_id=resolved)
-                )
-                await db.commit()
+        # Restore peer cache from stored access_hash BEFORE any RPC that needs the peer
+        if stored_hash is not None and client:
+            await restore_peer_in_session(client, stored_channel, stored_hash)
+        elif client:
+            # No stored hash: try a fresh resolve (works for @username channels)
+            try:
+                new_peer_id, new_hash = await resolve_upload_channel(client, stored_channel)
+                if new_hash is not None:
+                    async with AsyncSessionLocal() as db:
+                        await db.execute(
+                            update(UploadSession)
+                            .where(UploadSession.id == session_id)
+                            .values(
+                                channel_id=new_peer_id,
+                                channel_access_hash=new_hash,
+                            )
+                        )
+                        await db.commit()
+                    stored_channel = new_peer_id
+                    stored_hash = new_hash
+            except ValueError as e:
+                logger.error("Channel re-validation failed on resume", error=str(e))
+                raise ValueError(str(e)) from e
 
         orch = UploadOrchestrator(session_id=session_id)
         _active_sessions[session_id] = orch
         orch.start()
     else:
         orch.resume()
+
     async with AsyncSessionLocal() as db:
         await SessionRepository(db).set_status(session_id, SessionStatus.running)
         await db.commit()

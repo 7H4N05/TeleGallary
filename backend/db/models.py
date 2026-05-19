@@ -16,6 +16,7 @@ from typing import Optional
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -111,6 +112,9 @@ class UploadSession(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     root_folder: Mapped[str] = mapped_column(String, nullable=False)
     channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    # Telegram access_hash for the channel — required to address the peer
+    # by numeric ID after a reconnect (MemoryStorage loses it on restart).
+    channel_access_hash: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     account_id: Mapped[Optional[str]] = mapped_column(
         String, ForeignKey("accounts.id"), nullable=True
     )

@@ -1,5 +1,13 @@
 """
 FloodWait Handler — wraps Pyrogram calls with FloodWait sleep and optional multi-account failover.
+
+Reconnect behaviour
+===================
+Pyrogram's MemoryStorage loses the peer access_hash on every reconnect.  After
+re-starting the client this handler calls restore_peer_in_session() with the
+access_hash that was stored in the DB when the session was first created.  This
+injection is cheap (no network round-trip) and ensures all subsequent RPCs that
+address the channel by numeric ID succeed immediately.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ from pyrogram.errors import FloodWait, NetworkMigrate, SlowmodeWait
 
 from config.settings import get_settings
 from telegram.client_manager import get_client_manager
+from telegram.peer_utils import restore_peer_in_session
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,14 +35,22 @@ class FloodWaitHandler:
     3. Otherwise sleep with countdown ticks, then clear cooldown and retry
     """
 
-    def __init__(self, event_emitter: Optional[Callable] = None):
+    def __init__(
+        self,
+        event_emitter: Optional[Callable] = None,
+        channel_access_hash: Optional[int] = None,
+    ):
         self.event_emitter = event_emitter
+        # The access_hash stored in the DB for the upload channel.
+        # Injected into MemoryStorage after every reconnect so RPCs succeed.
+        self._channel_access_hash = channel_access_hash
 
     async def run(
         self,
         preferred_account_id: str,
         invoker: Callable[[Client], Awaitable[Any]],
         max_floodwait: int = 3600,
+        channel_id: str | None = None,
     ):
         mgr = get_client_manager()
         while True:
@@ -44,6 +61,27 @@ class FloodWaitHandler:
                 continue
 
             cur_id = managed.account_id
+
+            # ── Ensure the client is actually connected ───────────────────────
+            if not managed.client.is_connected:
+                logger.info("Client disconnected — reconnecting", account_id=cur_id)
+                try:
+                    await managed.client.start()
+                    logger.info("Client reconnected", account_id=cur_id)
+                except Exception as e:
+                    logger.warning("Reconnect failed", account_id=cur_id, error=str(e))
+                    await asyncio.sleep(2)
+                    continue
+
+                # Restore peer cache immediately after reconnect.
+                # MemoryStorage is empty again after start(); inject the stored
+                # access_hash so all RPCs addressing the channel by numeric ID
+                # succeed without a network round-trip.
+                if channel_id and self._channel_access_hash:
+                    await restore_peer_in_session(
+                        managed.client, channel_id, self._channel_access_hash
+                    )
+
             try:
                 return await invoker(managed.client)
             except FloodWait as e:

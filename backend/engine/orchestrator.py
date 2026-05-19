@@ -25,7 +25,7 @@ from db.repositories.account_repo import AccountRepository
 from engine.album_batcher import assign_album_indices
 from engine.folder_processor import FolderProcessor
 from telegram.client_manager import get_client_manager
-from telegram.peer_utils import resolve_upload_channel
+from telegram.peer_utils import resolve_upload_channel, restore_peer_in_session
 from telegram.uploader import TelegramUploader
 from utils.file_utils import get_folder_display_name, scan_folders
 from utils.logger import get_logger
@@ -128,34 +128,68 @@ class UploadOrchestrator:
 
             client = await client_mgr.get_client(session.account_id)
             if client:
-                try:
-                    resolved = await resolve_upload_channel(client, session.channel_id)
-                    if resolved != session.channel_id:
+                # ── Restore peer cache from stored access_hash ────────────
+                # This is the authoritative fix for PEER_ID_INVALID after
+                # reconnect.  MemoryStorage loses the access_hash on every
+                # restart; restoring it here means all subsequent RPCs that
+                # address the channel by numeric ID will succeed.
+                if session.channel_access_hash:
+                    await restore_peer_in_session(
+                        client, session.channel_id, session.channel_access_hash
+                    )
+                else:
+                    # No stored hash yet — resolve via get_chat() or get_dialogs()
+                    # fallback.  This covers both fresh sessions and old session
+                    # rows created before the access_hash column was added.
+                    try:
                         from sqlalchemy import update
                         from db.models import UploadSession
 
-                        await db.execute(
-                            update(UploadSession)
-                            .where(UploadSession.id == self.session_id)
-                            .values(channel_id=resolved)
+                        resolved, new_hash = await resolve_upload_channel(
+                            client, session.channel_id
                         )
-                        session.channel_id = resolved
+                        if new_hash:
+                            await db.execute(
+                                update(UploadSession)
+                                .where(UploadSession.id == self.session_id)
+                                .values(
+                                    channel_id=resolved,
+                                    channel_access_hash=new_hash,
+                                )
+                            )
+                            session.channel_id = resolved
+                            # Update in-memory so TelegramUploader gets the hash
+                            session.channel_access_hash = new_hash
+                            await db.commit()
+                            logger.info(
+                                "Stored access_hash from live resolve",
+                                session_id=self.session_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Could not obtain access_hash — uploads will fail with "
+                                "PEER_ID_INVALID. Open the channel in Telegram app with "
+                                "this account so it appears in recent dialogs, then retry.",
+                                session_id=self.session_id,
+                                channel_id=session.channel_id,
+                            )
+                    except ValueError as e:
+                        logger.error("Channel validation failed", error=str(e))
+                        await log_repo.write(
+                            f"[ERROR] Invalid channel: {e}",
+                            level=LogLevel.ERROR,
+                            session_id=self.session_id,
+                        )
+                        await session_repo.set_status(self.session_id, SessionStatus.failed)
                         await db.commit()
-                except ValueError as e:
-                    logger.error("Channel validation failed", error=str(e))
-                    await log_repo.write(
-                        f"[ERROR] Invalid channel: {e}",
-                        level=LogLevel.ERROR,
-                        session_id=self.session_id,
-                    )
-                    await session_repo.set_status(self.session_id, SessionStatus.failed)
-                    await db.commit()
-                    return
+                        return
 
             uploader = TelegramUploader(
                 preferred_account_id=session.account_id,
                 event_emitter=self._emit,
+                channel_access_hash=session.channel_access_hash,
             )
+
 
             # ── Build queue if first run ─────────────────────────────
             folders = await folder_repo.list_by_session(self.session_id)
