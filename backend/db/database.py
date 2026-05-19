@@ -35,6 +35,10 @@ def _set_sqlite_pragma(dbapi_conn, _connection_record):
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=30000")   # 30 s wait on lock (ms)
+    cursor.execute("PRAGMA cache_size=-64000")     # 64 MB page cache
+    cursor.execute("PRAGMA mmap_size=268435456")   # 256 MB memory-mapped I/O
+    cursor.execute("PRAGMA temp_store=MEMORY")     # temp tables in RAM
     cursor.close()
 
 

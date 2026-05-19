@@ -1,19 +1,23 @@
 """
 Folder Processor — handles upload of a single folder end-to-end.
 
+v2.0 — Integrated with metrics, adaptive controller, and reliability system.
+
 Flow per folder:
 1. Check if already completed (skip)
 2. Send START marker if not already sent
 3. Load pending files from DB
 4. Batch into albums of 10
-5. Upload each album
+5. Upload each album with per-phase timing
 6. Track per-file success/failure
-7. Send END marker
-8. Mark folder complete
+7. Record metrics for ETA and adaptive tuning
+8. Send END marker
+9. Mark folder complete
 """
 
 import asyncio
-from typing import Callable
+import time
+from typing import Callable, Optional
 
 from db.database import AsyncSessionLocal
 from db.models import FileStatus, FolderStatus
@@ -23,6 +27,8 @@ from db.repositories.folder_repo import FolderRepository
 from db.repositories.log_repo import LogRepository
 from db.models import LogLevel
 from config.settings import get_settings
+from monitoring.metrics import UploadMetrics, UploadTiming
+from monitoring.reliability_controller import ReliabilityController
 from telegram.uploader import TelegramUploader
 from utils.logger import get_logger
 
@@ -39,6 +45,8 @@ class FolderProcessor:
         event_emitter: Callable,
         stop_event: asyncio.Event,
         pause_event: asyncio.Event,
+        metrics: Optional[UploadMetrics] = None,
+        reliability: Optional[ReliabilityController] = None,
     ):
         self.folder_id = folder_id
         self.session_id = session_id
@@ -47,6 +55,8 @@ class FolderProcessor:
         self.event_emitter = event_emitter
         self.stop_event = stop_event
         self.pause_event = pause_event
+        self._metrics = metrics
+        self._reliability = reliability
 
     async def _emit_progress(self, file_repo: FileRepository, **kwargs):
         failed_n = await file_repo.count_failed_for_session(self.session_id)
@@ -158,6 +168,10 @@ class FolderProcessor:
                     album_idx=album_idx,
                     photos=len(album_files),
                 )
+
+                # v2: Record per-upload timing
+                upload_start = time.monotonic()
+
                 uploaded = await self._upload_album(
                     album_idx=album_idx,
                     album_files=album_files,
@@ -170,6 +184,34 @@ class FolderProcessor:
                     log_repo=log_repo,
                     db=db,
                 )
+
+                upload_end = time.monotonic()
+
+                # v2: Record metrics for this album batch
+                if self._metrics and self._reliability:
+                    for f in album_files:
+                        timing = UploadTiming(
+                            file_id=f.id,
+                            file_size_bytes=f.size_bytes,
+                            started_at=upload_start,
+                            completed_at=upload_end,
+                            # Distribute total time across phases (approximation)
+                            network_duration=(upload_end - upload_start) / len(album_files),
+                            success=uploaded,
+                        )
+                        self._metrics.record_upload(timing)
+
+                    if uploaded:
+                        self._reliability.on_upload_success()
+                    else:
+                        self._reliability.on_upload_failure()
+
+                # v2: Apply pacing delay from adaptive controller
+                if self._reliability:
+                    pacing = self._reliability.adaptive.params.pacing_delay_seconds
+                    if pacing > 0:
+                        await asyncio.sleep(pacing)
+
                 if not uploaded:
                     await self._emit_progress(
                         file_repo,
@@ -258,12 +300,26 @@ class FolderProcessor:
     ) -> bool:
         ok_count = 0
         for f, fid, path in zip(album_files, file_ids, file_paths):
+            # v2: Per-file timing for individual uploads
+            file_start = time.monotonic()
             try:
                 msg = await self.uploader.upload_photo_with_retry(self.channel_id, path)
                 if msg:
                     await file_repo.mark_uploaded(fid, msg.id)
                     await folder_repo.increment_uploaded(self.folder_id)
                     ok_count += 1
+
+                    # v2: Record successful individual upload timing
+                    if self._metrics:
+                        timing = UploadTiming(
+                            file_id=f.id,
+                            file_size_bytes=f.size_bytes,
+                            started_at=file_start,
+                            completed_at=time.monotonic(),
+                            network_duration=time.monotonic() - file_start,
+                            success=True,
+                        )
+                        self._metrics.record_upload(timing)
                 else:
                     raise RuntimeError("Upload returned no message")
             except Exception as e:
@@ -275,6 +331,18 @@ class FolderProcessor:
                     error_type=type(e).__name__,
                     error_message=err,
                 )
+                # v2: Record failed upload timing
+                if self._metrics:
+                    timing = UploadTiming(
+                        file_id=f.id,
+                        file_size_bytes=f.size_bytes,
+                        started_at=file_start,
+                        completed_at=time.monotonic(),
+                        success=False,
+                        error_type=type(e).__name__,
+                    )
+                    self._metrics.record_upload(timing)
+
         await db.commit()
         if ok_count:
             await log_repo.write(

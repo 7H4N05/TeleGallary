@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     floodwait_safety_buffer: int = 5
     session_dir: str = "./data/sessions"
 
+    # Monitoring & Self-Healing (v2)
+    stall_detection_threshold: int = 300       # seconds before declaring stall
+    health_check_interval: int = 10            # seconds between health samples
+    metrics_persist_interval: int = 30         # seconds between DB snapshots
+    dashboard_broadcast_interval: int = 5      # seconds between SSE dashboard updates
+    ema_alpha: float = 0.3                     # EMA smoothing factor (0.1=slow, 0.5=fast)
+    rolling_window_size: int = 200             # recent uploads to keep for statistics
+    max_concurrent_uploads: int = 4            # hard ceiling for adaptive controller
+    worker_recycle_after: int = 500            # restart worker after N uploads
+    recovery_cooldown: int = 60                # seconds between same recovery action
+
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -109,6 +120,17 @@ class Settings(BaseSettings):
                 "floodwait_safety_buffer", 5
             )
             flat["session_dir"] = cfg["telegram"].get("session_dir", "./data/sessions")
+
+        if "monitoring" in cfg:
+            flat["stall_detection_threshold"] = cfg["monitoring"].get("stall_detection_threshold", 300)
+            flat["health_check_interval"] = cfg["monitoring"].get("health_check_interval", 10)
+            flat["metrics_persist_interval"] = cfg["monitoring"].get("metrics_persist_interval", 30)
+            flat["dashboard_broadcast_interval"] = cfg["monitoring"].get("dashboard_broadcast_interval", 5)
+            flat["ema_alpha"] = cfg["monitoring"].get("ema_alpha", 0.3)
+            flat["rolling_window_size"] = cfg["monitoring"].get("rolling_window_size", 200)
+            flat["max_concurrent_uploads"] = cfg["monitoring"].get("max_concurrent_uploads", 4)
+            flat["worker_recycle_after"] = cfg["monitoring"].get("worker_recycle_after", 500)
+            flat["recovery_cooldown"] = cfg["monitoring"].get("recovery_cooldown", 60)
 
         return cls(**flat)
 

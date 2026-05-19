@@ -1,6 +1,8 @@
 """
 FloodWait Handler — wraps Pyrogram calls with FloodWait sleep and optional multi-account failover.
 
+v2.0 — Integrated with metrics and reliability controller.
+
 Reconnect behaviour
 ===================
 Pyrogram's MemoryStorage loses the peer access_hash on every reconnect.  After
@@ -33,6 +35,8 @@ class FloodWaitHandler:
     1. Mark the account that was rate-limited
     2. If another connected account is available and failover is enabled, retry immediately
     3. Otherwise sleep with countdown ticks, then clear cooldown and retry
+
+    v2: Reports FloodWait events and reconnects to the reliability controller.
     """
 
     def __init__(
@@ -68,6 +72,10 @@ class FloodWaitHandler:
                 try:
                     await managed.client.start()
                     logger.info("Client reconnected", account_id=cur_id)
+
+                    # v2: Report reconnect to reliability controller
+                    self._report_reconnect()
+
                 except Exception as e:
                     logger.warning("Reconnect failed", account_id=cur_id, error=str(e))
                     await asyncio.sleep(2)
@@ -99,6 +107,9 @@ class FloodWaitHandler:
                     ) from e
 
                 mgr.mark_floodwait(cur_id, wait_int)
+
+                # v2: Report FloodWait to reliability controller
+                self._report_floodwait(wait_int)
 
                 if self.event_emitter:
                     await self.event_emitter(
@@ -149,3 +160,25 @@ class FloodWaitHandler:
             except (NetworkMigrate, SlowmodeWait) as e:
                 logger.warning("Telegram network issue", error=str(e))
                 await asyncio.sleep(5)
+
+    @staticmethod
+    def _report_floodwait(wait_seconds: float):
+        """Report FloodWait to the reliability controller (if active)."""
+        try:
+            from monitoring.reliability_controller import get_reliability_controller
+            ctrl = get_reliability_controller()
+            if ctrl:
+                ctrl.on_floodwait(wait_seconds)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _report_reconnect():
+        """Report client reconnect to the reliability controller (if active)."""
+        try:
+            from monitoring.reliability_controller import get_reliability_controller
+            ctrl = get_reliability_controller()
+            if ctrl:
+                ctrl.on_reconnect()
+        except Exception:
+            pass
